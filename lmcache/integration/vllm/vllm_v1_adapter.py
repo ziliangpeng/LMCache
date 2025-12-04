@@ -916,6 +916,7 @@ class LMCacheConnectorV1Impl:
             the same.
         """
         self.current_layer = 0
+        self.layerwise_storers = []  # Clear stale generators from previous batch
 
         if len(self.kv_caches) == 0:
             self._init_kv_caches_from_forward_context(forward_context)
