@@ -1315,11 +1315,12 @@ class LMCacheConnectorV1Impl:
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             # Debug info for to_device performance
             logger.info(
-                "[to_device debug] size=%s, numel=%d, is_contiguous=%s, device=%s",
+                "[to_device debug] size=%s, numel=%d, is_contiguous=%s, device=%s, is_pinned=%s",
                 slot_mapping.shape,
                 slot_mapping.numel(),
                 slot_mapping.is_contiguous(),
                 slot_mapping.device,
+                slot_mapping.is_pinned(),
             )
 
             t_to_device = time.perf_counter()
