@@ -1287,6 +1287,8 @@ class LMCacheConnectorV1Impl:
         # Timing accumulators
         unpin_times = []
         prep_times = []
+        pin_times = []
+        to_times = []
         to_device_times = []
         store_times = []
 
@@ -1315,7 +1317,7 @@ class LMCacheConnectorV1Impl:
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             # Debug info for to_device performance
             logger.info(
-                "[to_device debug] size=%s, numel=%d, is_contiguous=%s, device=%s, is_pinned=%s",
+                "[to_device debug BEFORE] size=%s, numel=%d, is_contiguous=%s, device=%s, is_pinned=%s",
                 slot_mapping.shape,
                 slot_mapping.numel(),
                 slot_mapping.is_contiguous(),
@@ -1323,9 +1325,26 @@ class LMCacheConnectorV1Impl:
                 slot_mapping.is_pinned(),
             )
 
+            # Profile pin_memory() separately from to()
+            t_pin_start = time.perf_counter()
+            slot_mapping_pinned = slot_mapping.pin_memory()
+            pin_time_ms = (time.perf_counter() - t_pin_start) * 1000
+
+            logger.info(
+                "[to_device debug AFTER PIN] is_pinned=%s, pin_time=%.2fms",
+                slot_mapping_pinned.is_pinned(),
+                pin_time_ms,
+            )
+
             t_to_device = time.perf_counter()
-            slot_mapping = slot_mapping.pin_memory().to(self.device)
-            to_device_times.append((time.perf_counter() - t_to_device) * 1000)
+            slot_mapping = slot_mapping_pinned.to(self.device)
+            to_time_ms = (time.perf_counter() - t_to_device) * 1000
+
+            logger.info("[to_device debug TO GPU] to_time=%.2fms", to_time_ms)
+
+            pin_times.append(pin_time_ms)
+            to_times.append(to_time_ms)
+            to_device_times.append(pin_time_ms + to_time_ms)
 
             skip_leading_tokens = save_spec.skip_leading_tokens
             # shared storage disaggregation will not have a disagg_spec passed in
@@ -1408,6 +1427,8 @@ class LMCacheConnectorV1Impl:
                 "[wait_for_save timing] total=%.2fms requests=%d | "
                 "unpin: sum=%.2fms p50=%.2fms p90=%.2fms | "
                 "prep: sum=%.2fms p50=%.2fms p90=%.2fms | "
+                "pin: sum=%.2fms p50=%.2fms p90=%.2fms | "
+                "to: sum=%.2fms p50=%.2fms p90=%.2fms | "
                 "to_device: sum=%.2fms p50=%.2fms p90=%.2fms | "
                 "store: sum=%.2fms p50=%.2fms p90=%.2fms",
                 total_time,
@@ -1418,6 +1439,12 @@ class LMCacheConnectorV1Impl:
                 sum(prep_times),
                 percentile(prep_times, 0.5),
                 percentile(prep_times, 0.9),
+                sum(pin_times),
+                percentile(pin_times, 0.5),
+                percentile(pin_times, 0.9),
+                sum(to_times),
+                percentile(to_times, 0.5),
+                percentile(to_times, 0.9),
                 sum(to_device_times),
                 percentile(to_device_times, 0.5),
                 percentile(to_device_times, 0.9),
