@@ -1340,11 +1340,22 @@ class LMCacheConnectorV1Impl:
             )
 
             # Step 0: Check if GPU is busy (sync before copy)
-            t_sync_before = time.perf_counter()
-            torch.cuda.synchronize()
-            sync_before_ms = (time.perf_counter() - t_sync_before) * 1000
+            # COMMENTED OUT FOR TESTING - synchronize causes GPU utilization drops
+            # Instead, use stream.query() to check if GPU has pending work
+            stream = torch.cuda.current_stream()
+            gpu_busy = not stream.query()  # False = idle, True = busy
 
-            logger.info("[to_device debug SYNC_BEFORE] sync_time=%.2fms", sync_before_ms)
+            logger.info(
+                "[to_device debug GPU_CHECK] gpu_busy=%s (before CPU→GPU copy)",
+                gpu_busy
+            )
+
+            # t_sync_before = time.perf_counter()
+            # torch.cuda.synchronize()
+            # sync_before_ms = (time.perf_counter() - t_sync_before) * 1000
+            sync_before_ms = 0.0  # Disabled for testing
+
+            # logger.info("[to_device debug SYNC_BEFORE] sync_time=%.2fms", sync_before_ms)
 
             # Step 1: Allocate GPU memory
             t_alloc = time.perf_counter()
