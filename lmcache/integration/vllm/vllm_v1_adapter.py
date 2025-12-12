@@ -1288,6 +1288,7 @@ class LMCacheConnectorV1Impl:
         unpin_times = []
         prep_times = []
         pin_times = []
+        sync_before_times = []
         alloc_times = []
         copy_times = []
         to_times = []
@@ -1338,6 +1339,13 @@ class LMCacheConnectorV1Impl:
                 pin_time_ms,
             )
 
+            # Step 0: Check if GPU is busy (sync before copy)
+            t_sync_before = time.perf_counter()
+            torch.cuda.synchronize()
+            sync_before_ms = (time.perf_counter() - t_sync_before) * 1000
+
+            logger.info("[to_device debug SYNC_BEFORE] sync_time=%.2fms", sync_before_ms)
+
             # Step 1: Allocate GPU memory
             t_alloc = time.perf_counter()
             slot_mapping_gpu = torch.empty_like(slot_mapping_pinned, device=self.device)
@@ -1345,7 +1353,7 @@ class LMCacheConnectorV1Impl:
 
             logger.info("[to_device debug ALLOC] alloc_time=%.2fms", alloc_time_ms)
 
-            # Step 2: Copy data from pinned CPU memory to GPU
+            # Step 2: Copy data from pinned CPU memory to GPU (GPU should be idle now)
             t_copy = time.perf_counter()
             slot_mapping_gpu.copy_(slot_mapping_pinned, non_blocking=False)
             copy_time_ms = (time.perf_counter() - t_copy) * 1000
@@ -1356,6 +1364,7 @@ class LMCacheConnectorV1Impl:
             to_time_ms = alloc_time_ms + copy_time_ms
 
             pin_times.append(pin_time_ms)
+            sync_before_times.append(sync_before_ms)
             alloc_times.append(alloc_time_ms)
             copy_times.append(copy_time_ms)
             to_times.append(to_time_ms)
@@ -1443,6 +1452,7 @@ class LMCacheConnectorV1Impl:
                 "unpin: sum=%.2fms p50=%.2fms p90=%.2fms | "
                 "prep: sum=%.2fms p50=%.2fms p90=%.2fms | "
                 "pin: sum=%.2fms p50=%.2fms p90=%.2fms | "
+                "sync_before: sum=%.2fms p50=%.2fms p90=%.2fms | "
                 "alloc: sum=%.2fms p50=%.2fms p90=%.2fms | "
                 "copy: sum=%.2fms p50=%.2fms p90=%.2fms | "
                 "to: sum=%.2fms p50=%.2fms p90=%.2fms | "
@@ -1459,6 +1469,9 @@ class LMCacheConnectorV1Impl:
                 sum(pin_times),
                 percentile(pin_times, 0.5),
                 percentile(pin_times, 0.9),
+                sum(sync_before_times),
+                percentile(sync_before_times, 0.5),
+                percentile(sync_before_times, 0.9),
                 sum(alloc_times),
                 percentile(alloc_times, 0.5),
                 percentile(alloc_times, 0.9),
