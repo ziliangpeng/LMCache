@@ -1324,7 +1324,7 @@ class LMCacheConnectorV1Impl:
             )
 
             t_to_device = time.perf_counter()
-            slot_mapping = slot_mapping.to(self.device)
+            slot_mapping = slot_mapping.pin_memory().to(self.device)
             to_device_times.append((time.perf_counter() - t_to_device) * 1000)
 
             skip_leading_tokens = save_spec.skip_leading_tokens
