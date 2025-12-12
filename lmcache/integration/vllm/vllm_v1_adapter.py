@@ -1288,6 +1288,8 @@ class LMCacheConnectorV1Impl:
         unpin_times = []
         prep_times = []
         pin_times = []
+        alloc_times = []
+        copy_times = []
         to_times = []
         to_device_times = []
         store_times = []
@@ -1325,7 +1327,7 @@ class LMCacheConnectorV1Impl:
                 slot_mapping.is_pinned(),
             )
 
-            # Profile pin_memory() separately from to()
+            # Profile pin_memory() separately from allocation and copy
             t_pin_start = time.perf_counter()
             slot_mapping_pinned = slot_mapping.pin_memory()
             pin_time_ms = (time.perf_counter() - t_pin_start) * 1000
@@ -1336,13 +1338,26 @@ class LMCacheConnectorV1Impl:
                 pin_time_ms,
             )
 
-            t_to_device = time.perf_counter()
-            slot_mapping = slot_mapping_pinned.to(self.device)
-            to_time_ms = (time.perf_counter() - t_to_device) * 1000
+            # Step 1: Allocate GPU memory
+            t_alloc = time.perf_counter()
+            slot_mapping_gpu = torch.empty_like(slot_mapping_pinned, device=self.device)
+            alloc_time_ms = (time.perf_counter() - t_alloc) * 1000
 
-            logger.info("[to_device debug TO GPU] to_time=%.2fms", to_time_ms)
+            logger.info("[to_device debug ALLOC] alloc_time=%.2fms", alloc_time_ms)
+
+            # Step 2: Copy data from pinned CPU memory to GPU
+            t_copy = time.perf_counter()
+            slot_mapping_gpu.copy_(slot_mapping_pinned, non_blocking=False)
+            copy_time_ms = (time.perf_counter() - t_copy) * 1000
+
+            logger.info("[to_device debug COPY] copy_time=%.2fms", copy_time_ms)
+
+            slot_mapping = slot_mapping_gpu
+            to_time_ms = alloc_time_ms + copy_time_ms
 
             pin_times.append(pin_time_ms)
+            alloc_times.append(alloc_time_ms)
+            copy_times.append(copy_time_ms)
             to_times.append(to_time_ms)
             to_device_times.append(pin_time_ms + to_time_ms)
 
@@ -1428,6 +1443,8 @@ class LMCacheConnectorV1Impl:
                 "unpin: sum=%.2fms p50=%.2fms p90=%.2fms | "
                 "prep: sum=%.2fms p50=%.2fms p90=%.2fms | "
                 "pin: sum=%.2fms p50=%.2fms p90=%.2fms | "
+                "alloc: sum=%.2fms p50=%.2fms p90=%.2fms | "
+                "copy: sum=%.2fms p50=%.2fms p90=%.2fms | "
                 "to: sum=%.2fms p50=%.2fms p90=%.2fms | "
                 "to_device: sum=%.2fms p50=%.2fms p90=%.2fms | "
                 "store: sum=%.2fms p50=%.2fms p90=%.2fms",
@@ -1442,6 +1459,12 @@ class LMCacheConnectorV1Impl:
                 sum(pin_times),
                 percentile(pin_times, 0.5),
                 percentile(pin_times, 0.9),
+                sum(alloc_times),
+                percentile(alloc_times, 0.5),
+                percentile(alloc_times, 0.9),
+                sum(copy_times),
+                percentile(copy_times, 0.5),
+                percentile(copy_times, 0.9),
                 sum(to_times),
                 percentile(to_times, 0.5),
                 percentile(to_times, 0.9),
