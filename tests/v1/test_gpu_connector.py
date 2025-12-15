@@ -158,6 +158,9 @@ def test_vllm_paged_connector_v2_with_gpu_and_mla(use_gpu, use_mla):
             slot_mapping=slot_mapping,
             offset=0,
         )
+        # Synchronize after from_gpu to ensure data is ready for CPU
+        if not memory_obj.tensor.is_cuda:
+            connector.store_stream.synchronize()
         recover_gpu_connector_states(connector)
         if use_mla:
             assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT
@@ -174,6 +177,128 @@ def test_vllm_paged_connector_v2_with_gpu_and_mla(use_gpu, use_mla):
         allocator.free(memory_obj)
         assert allocator.memcheck()
 
+    if use_mla:
+        check_paged_kv_cache_equal_with_mla(
+            gpu_kv_src, gpu_kv_dst, slot_mapping, head_size
+        )
+    else:
+        check_paged_kv_cache_equal(
+            gpu_kv_src, gpu_kv_dst, slot_mapping, num_heads, head_size
+        )
+    allocator.close()
+
+
+@pytest.mark.parametrize("use_gpu", [True, False])
+@pytest.mark.parametrize("use_mla", [True, False])
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
+)
+def test_vllm_paged_connector_v2_batched_from_gpu(use_gpu, use_mla):
+    """
+    Test batched_from_gpu with multiple memory objects.
+    This test validates the batch-level synchronization optimization.
+    """
+    num_blocks = 100
+    block_size = 16
+    num_layers = 32
+    num_heads = 1 if use_mla else 8
+    head_size = 128
+    device = "cuda"
+    hidden_dim = num_heads * head_size
+
+    num_tokens = 800
+    chunk_size = 256
+
+    allocator = PinMemoryAllocator(1024 * 1024 * 1024)
+
+    gpu_kv_src = generate_kv_cache_paged_list_tensors(
+        num_blocks=num_blocks, device=device, block_size=block_size, use_mla=use_mla
+    )
+    gpu_kv_dst = generate_kv_cache_paged_list_tensors(
+        num_blocks=num_blocks, device=device, block_size=block_size, use_mla=use_mla
+    )
+
+    slot_mapping = random.sample(range(0, num_blocks * block_size), num_tokens)
+    slot_mapping = torch.tensor(slot_mapping, device=device, dtype=torch.int64)
+
+    # Check the gpu_kv is not the same before copying
+    with pytest.raises(AssertionError):
+        if use_mla:
+            check_paged_kv_cache_equal_with_mla(
+                gpu_kv_src, gpu_kv_dst, slot_mapping, head_size
+            )
+        else:
+            check_paged_kv_cache_equal(
+                gpu_kv_src, gpu_kv_dst, slot_mapping, num_heads, head_size
+            )
+
+    connector = VLLMPagedMemGPUConnectorV2(
+        hidden_dim,
+        num_layers,
+        use_gpu=use_gpu,
+        chunk_size=chunk_size,
+        dtype=gpu_kv_src[0].dtype,
+        device=device,
+        use_mla=use_mla,
+    )
+    connector2 = VLLMPagedMemGPUConnectorV2(
+        hidden_dim,
+        num_layers,
+        use_gpu=use_gpu,
+        chunk_size=chunk_size,
+        dtype=gpu_kv_src[0].dtype,
+        device=device,
+        use_mla=use_mla,
+    )
+    assert connector.use_mla == use_mla
+    assert connector2.use_mla == use_mla
+
+    # Prepare batched memory objects, starts, and ends
+    memory_objs = []
+    starts = []
+    ends = []
+    for start in range(0, num_tokens, chunk_size):
+        end = min(start + chunk_size, num_tokens)
+        shape = connector.get_shape(end - start)
+        memory_obj = allocator.allocate(shape, gpu_kv_src[0][0].dtype)
+        memory_objs.append(memory_obj)
+        starts.append(start)
+        ends.append(end)
+
+    # Call batched_from_gpu (THIS IS THE KEY TEST - tests your optimization!)
+    connector.batched_from_gpu(
+        memory_objs,
+        starts,
+        ends,
+        kvcaches=gpu_kv_src,
+        slot_mapping=slot_mapping,
+        offset=0,
+    )
+
+    # Verify format for all memory objects
+    for memory_obj in memory_objs:
+        if use_mla:
+            assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT
+        else:
+            assert memory_obj.metadata.fmt == MemoryFormat.KV_2LTD
+
+    # Copy back to GPU using batched_to_gpu
+    connector2.batched_to_gpu(
+        memory_objs,
+        starts,
+        ends,
+        kvcaches=gpu_kv_dst,
+        slot_mapping=slot_mapping,
+        offset=0,
+    )
+
+    # Free all memory objects
+    for memory_obj in memory_objs:
+        allocator.free(memory_obj)
+    assert allocator.memcheck()
+
+    # Verify correctness
     if use_mla:
         check_paged_kv_cache_equal_with_mla(
             gpu_kv_src, gpu_kv_dst, slot_mapping, head_size

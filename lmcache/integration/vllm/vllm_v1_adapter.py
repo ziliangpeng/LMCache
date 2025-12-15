@@ -1259,6 +1259,9 @@ class LMCacheConnectorV1Impl:
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
+        import time
+
+        t_total = time.perf_counter()
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
@@ -1281,9 +1284,24 @@ class LMCacheConnectorV1Impl:
 
         assert self.lmcache_engine is not None
 
+        # Timing accumulators
+        unpin_times = []
+        prep_times = []
+        pin_times = []
+        sync_before_times = []
+        alloc_times = []
+        copy_times = []
+        to_times = []
+        to_device_times = []
+        store_times = []
+
         for request in connector_metadata.requests:
             # unpin the kv caches according to req_id
+            t_unpin = time.perf_counter()
             self.lmcache_engine.lookup_unpin(request.req_id)
+            unpin_times.append((time.perf_counter() - t_unpin) * 1000)
+
+            t_prep = time.perf_counter()
 
             save_spec = request.save_spec
             if (
@@ -1297,8 +1315,71 @@ class LMCacheConnectorV1Impl:
             assert isinstance(slot_mapping, torch.Tensor)
             assert len(slot_mapping) == len(token_ids)
 
+            prep_times.append((time.perf_counter() - t_prep) * 1000)
+
             # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = slot_mapping.to(self.device)
+            # Debug info for to_device performance
+            logger.info(
+                "[to_device debug BEFORE] size=%s, numel=%d, is_contiguous=%s, device=%s, is_pinned=%s",
+                slot_mapping.shape,
+                slot_mapping.numel(),
+                slot_mapping.is_contiguous(),
+                slot_mapping.device,
+                slot_mapping.is_pinned(),
+            )
+
+            # Profile pin_memory() separately from allocation and copy
+            t_pin_start = time.perf_counter()
+            slot_mapping_pinned = slot_mapping.pin_memory()
+            pin_time_ms = (time.perf_counter() - t_pin_start) * 1000
+
+            logger.info(
+                "[to_device debug AFTER PIN] is_pinned=%s, pin_time=%.2fms",
+                slot_mapping_pinned.is_pinned(),
+                pin_time_ms,
+            )
+
+            # Step 0: Check if GPU is busy (sync before copy)
+            # COMMENTED OUT FOR TESTING - synchronize causes GPU utilization drops
+            # Instead, use stream.query() to check if GPU has pending work
+            stream = torch.cuda.current_stream()
+            gpu_busy = not stream.query()  # False = idle, True = busy
+
+            logger.info(
+                "[to_device debug GPU_CHECK] gpu_busy=%s (before CPU→GPU copy)",
+                gpu_busy
+            )
+
+            # t_sync_before = time.perf_counter()
+            # torch.cuda.synchronize()
+            # sync_before_ms = (time.perf_counter() - t_sync_before) * 1000
+            sync_before_ms = 0.0  # Disabled for testing
+
+            # logger.info("[to_device debug SYNC_BEFORE] sync_time=%.2fms", sync_before_ms)
+
+            # Step 1: Allocate GPU memory
+            t_alloc = time.perf_counter()
+            slot_mapping_gpu = torch.empty_like(slot_mapping_pinned, device=self.device)
+            alloc_time_ms = (time.perf_counter() - t_alloc) * 1000
+
+            logger.info("[to_device debug ALLOC] alloc_time=%.2fms", alloc_time_ms)
+
+            # Step 2: Copy data from pinned CPU memory to GPU (blocking to ensure data is ready)
+            t_copy = time.perf_counter()
+            slot_mapping_gpu.copy_(slot_mapping_pinned, non_blocking=False)
+            copy_time_ms = (time.perf_counter() - t_copy) * 1000
+
+            logger.info("[to_device debug COPY] copy_time=%.2fms", copy_time_ms)
+
+            slot_mapping = slot_mapping_gpu
+            to_time_ms = alloc_time_ms + copy_time_ms
+
+            pin_times.append(pin_time_ms)
+            sync_before_times.append(sync_before_ms)
+            alloc_times.append(alloc_time_ms)
+            copy_times.append(copy_time_ms)
+            to_times.append(to_time_ms)
+            to_device_times.append(pin_time_ms + to_time_ms)
 
             skip_leading_tokens = save_spec.skip_leading_tokens
             # shared storage disaggregation will not have a disagg_spec passed in
@@ -1342,6 +1423,7 @@ class LMCacheConnectorV1Impl:
                     store_mask = store_mask[:aligned_token_len]
                     slot_mapping = slot_mapping[:aligned_token_len]
 
+            t_store = time.perf_counter()
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
@@ -1351,6 +1433,7 @@ class LMCacheConnectorV1Impl:
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
             )
+            store_times.append((time.perf_counter() - t_store) * 1000)
 
             # Update skip_leading_tokens only on last rank to ensure
             # each PP stage stores its own KV cache
@@ -1359,6 +1442,63 @@ class LMCacheConnectorV1Impl:
                 save_spec.skip_leading_tokens = len(token_ids)
                 if request.disagg_spec:
                     request.disagg_spec.num_transferred_tokens = len(token_ids)
+
+        # Calculate statistics
+        def percentile(data, p):
+            if not data:
+                return 0.0
+            sorted_data = sorted(data)
+            k = (len(sorted_data) - 1) * p
+            f = int(k)
+            c = f + 1 if f + 1 < len(sorted_data) else f
+            return sorted_data[f] + (k - f) * (sorted_data[c] - sorted_data[f])
+
+        # Log detailed timing breakdown
+        total_time = (time.perf_counter() - t_total) * 1000
+        num_requests = len(store_times)
+
+        if num_requests > 0:
+            logger.info(
+                "[wait_for_save timing] total=%.2fms requests=%d | "
+                "unpin: sum=%.2fms p50=%.2fms p90=%.2fms | "
+                "prep: sum=%.2fms p50=%.2fms p90=%.2fms | "
+                "pin: sum=%.2fms p50=%.2fms p90=%.2fms | "
+                "sync_before: sum=%.2fms p50=%.2fms p90=%.2fms | "
+                "alloc: sum=%.2fms p50=%.2fms p90=%.2fms | "
+                "copy: sum=%.2fms p50=%.2fms p90=%.2fms | "
+                "to: sum=%.2fms p50=%.2fms p90=%.2fms | "
+                "to_device: sum=%.2fms p50=%.2fms p90=%.2fms | "
+                "store: sum=%.2fms p50=%.2fms p90=%.2fms",
+                total_time,
+                num_requests,
+                sum(unpin_times),
+                percentile(unpin_times, 0.5),
+                percentile(unpin_times, 0.9),
+                sum(prep_times),
+                percentile(prep_times, 0.5),
+                percentile(prep_times, 0.9),
+                sum(pin_times),
+                percentile(pin_times, 0.5),
+                percentile(pin_times, 0.9),
+                sum(sync_before_times),
+                percentile(sync_before_times, 0.5),
+                percentile(sync_before_times, 0.9),
+                sum(alloc_times),
+                percentile(alloc_times, 0.5),
+                percentile(alloc_times, 0.9),
+                sum(copy_times),
+                percentile(copy_times, 0.5),
+                percentile(copy_times, 0.9),
+                sum(to_times),
+                percentile(to_times, 0.5),
+                percentile(to_times, 0.9),
+                sum(to_device_times),
+                percentile(to_device_times, 0.5),
+                percentile(to_device_times, 0.9),
+                sum(store_times),
+                percentile(store_times, 0.5),
+                percentile(store_times, 0.9),
+            )
 
     @_lmcache_nvtx_annotate
     def get_finished(
