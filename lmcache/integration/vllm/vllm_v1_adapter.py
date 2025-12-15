@@ -1364,12 +1364,12 @@ class LMCacheConnectorV1Impl:
 
             logger.info("[to_device debug ALLOC] alloc_time=%.2fms", alloc_time_ms)
 
-            # Step 2: Copy data from pinned CPU memory to GPU (non-blocking to avoid waiting for GPU compute)
+            # Step 2: Copy data from pinned CPU memory to GPU (blocking to ensure data is ready)
             t_copy = time.perf_counter()
-            slot_mapping_gpu.copy_(slot_mapping_pinned, non_blocking=True)
+            slot_mapping_gpu.copy_(slot_mapping_pinned, non_blocking=False)
             copy_time_ms = (time.perf_counter() - t_copy) * 1000
 
-            logger.info("[to_device debug COPY] copy_launch_time=%.2fms (non-blocking)", copy_time_ms)
+            logger.info("[to_device debug COPY] copy_time=%.2fms", copy_time_ms)
 
             slot_mapping = slot_mapping_gpu
             to_time_ms = alloc_time_ms + copy_time_ms
